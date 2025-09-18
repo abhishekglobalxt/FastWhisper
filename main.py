@@ -43,6 +43,7 @@ def supabase_headers(extra=None):
 
 def sb_download_object(bucket: str, path: str, dest_file: Path):
     url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}"
+    print("DOWNLOAD:", f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}", flush=True)
     with requests.get(url, headers=supabase_headers(), stream=True) as r:
         if r.status_code >= 300:
             raise HTTPException(status_code=502, detail=f"Supabase download failed {r.status_code}: {r.text}")
@@ -160,6 +161,7 @@ def process_video(payload: ProcessIn):
         }
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
 
 
 
