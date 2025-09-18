@@ -13,6 +13,14 @@ PROCESSED_BUCKET = os.environ.get("PROCESSED_BUCKET", "processed")
 TRANSCRIPTS_BUCKET = os.environ.get("TRANSCRIPTS_BUCKET", "transcripts")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")  # "small" for better quality
 
+#----Health
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 # --------- FASTAPI ----------
 app = FastAPI(title="Video Processing Worker", version="1.0.0")
 
@@ -151,3 +159,4 @@ def process_video(payload: ProcessIn):
         }
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
