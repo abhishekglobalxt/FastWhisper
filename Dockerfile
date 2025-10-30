@@ -15,7 +15,7 @@ COPY main.py .
 
 # Env placeholders (set real ones in the platform dashboard)
 ENV SUPABASE_URL=""
-ENV SUPABASE_SERVICE_ROLE=""
+ENV SUPABASE_KEY=""
 ENV RAW_BUCKET=raw
 ENV PROCESSED_BUCKET=processed
 ENV TRANSCRIPTS_BUCKET=transcripts
@@ -23,3 +23,4 @@ ENV WHISPER_MODEL=base
 
 EXPOSE 8080
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+
