@@ -5,4 +5,3 @@ faster-whisper==1.0.3
 supabase==2.3.5
 python-dotenv==1.0.1
 pydantic==2.9.2
-httpx==0.25.2
