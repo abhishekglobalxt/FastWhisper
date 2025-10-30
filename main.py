@@ -102,7 +102,7 @@ def sb_download(bucket: str, path_in_bucket: str, dest_path: str, rid: str):
         log(f"DOWNLOAD (signed URL) -> {url}", rid)
         r = requests.get(url, stream=True, timeout=120)
     else:
-        url = f"{SUPABASE_URL}/storage/v1/object/raw/{bucket}/{path_in_bucket}"
+        url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path_in_bucket}"
         log(f"DOWNLOAD (bucket path) -> {url}", rid)
         r = requests.get(url, headers=sb_headers(), stream=True, timeout=120)
 
@@ -253,3 +253,4 @@ def process(data: dict, x_api_key: str = Header(None)):
                 log("CLEANUP temp dir", rid)
         except Exception:
             log("CLEANUP error (ignored)", rid)
+
