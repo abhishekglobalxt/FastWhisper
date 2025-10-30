@@ -19,7 +19,7 @@ TRANSCRIPTS_BUCKET = os.environ.get("TRANSCRIPTS_BUCKET", "transcripts")
 API_KEY = os.environ.get("TRANSCRIBE_API_KEY", "changeme")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "medium")
 DEBUG = os.environ.get("DEBUG", "0") == "1"
-LOG_BODY = os.environ.get("LOG_BODY", "0") == "1"  # print response snippets
+LOG_BODY = os.environ.get("LOG_BODY", "0") == "1"  # print response snippets for failures
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_KEY (or SUPABASE_SERVICE_ROLE) must be set")
@@ -54,7 +54,7 @@ log("Whisper model loaded.")
 
 # ========= SUPABASE STORAGE (REST) =========
 def sb_headers(extra=None):
-    # Some Supabase deployments require both Authorization and apikey
+    # Some Supabase setups want both Authorization and apikey
     h = {
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "apikey": SUPABASE_KEY,
@@ -70,12 +70,11 @@ def normalize_path_in_bucket(raw_path: str, rid: str) -> str:
       - raw URL (…/storage/v1/object/raw/<bucket>/<path>)
       - path with bucket prefix (raw/abc/def.webm)
       - path inside bucket (abc/def.webm)
-    Returns: path inside the bucket only (abc/def.webm)
+    Returns path inside the bucket only (abc/def.webm).
     """
     p = raw_path or ""
     if p.startswith("http"):
         # extract bucket & path from URL
-        # matches both .../object/sign/<bucket>/<path>?... and .../object/raw/<bucket>/<path>
         import re
         m = re.search(r"/storage/v1/object/(?:sign|raw)/([^/]+)/(.+?)(?:\?|$)", p)
         if m:
@@ -93,16 +92,16 @@ def normalize_path_in_bucket(raw_path: str, rid: str) -> str:
 
 def sb_download(bucket: str, path_in_bucket: str, dest_path: str, rid: str):
     """
-    Downloads either:
-     - from a path inside the bucket (authorized call)
-     - or from a signed URL (if caller passed a full URL in 'path_in_bucket')
+    Download from a path inside the bucket (authorized call),
+    or from a signed URL if 'path_in_bucket' happens to be a full URL.
     """
     if path_in_bucket.startswith("http"):
         url = path_in_bucket
         log(f"DOWNLOAD (signed URL) -> {url}", rid)
         r = requests.get(url, stream=True, timeout=120)
     else:
-        url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path_in_bucket}"
+        # NOTE: /object/raw worked for your project, keeping it consistent with your successful logs
+        url = f"{SUPABASE_URL}/storage/v1/object/raw/{bucket}/{path_in_bucket}"
         log(f"DOWNLOAD (bucket path) -> {url}", rid)
         r = requests.get(url, headers=sb_headers(), stream=True, timeout=120)
 
@@ -133,20 +132,6 @@ def convert_to_wav(input_path: str, output_path: str, rid: str):
     log(f"FFMPEG to WAV: {' '.join(cmd)}", rid)
     subprocess.run(cmd, check=True)
     log("FFMPEG WAV OK", rid)
-
-def export_hls(input_path: str, output_dir: str, rid: str):
-    os.makedirs(output_dir, exist_ok=True)
-    m3u8_path = os.path.join(output_dir, "master.m3u8")
-    cmd = [
-        "ffmpeg", "-i", input_path,
-        "-c:v", "libx264", "-c:a", "aac",
-        "-f", "hls", "-hls_time", "4", "-hls_list_size", "0",
-        m3u8_path
-    ]
-    log(f"FFMPEG HLS: {' '.join(cmd)}", rid)
-    subprocess.run(cmd, check=True)
-    log("FFMPEG HLS OK", rid)
-    return m3u8_path
 
 def run_transcription(audio_path: str, rid: str):
     log("WHISPER: transcribe start", rid)
@@ -195,30 +180,23 @@ def process(data: dict, x_api_key: str = Header(None)):
         temp_dir = tempfile.mkdtemp()
         log(f"TEMP DIR -> {temp_dir}", rid)
 
-        # 1) Download RAW
+        # 1) Download RAW (.webm expected)
         local_raw = os.path.join(temp_dir, os.path.basename(path_in_bucket) or "input.webm")
         sb_download(RAW_BUCKET, path_in_bucket, local_raw, rid)
 
-        # 2) Convert to WAV
+        # 2) Convert to WAV for Whisper
         local_wav = os.path.join(temp_dir, "audio.wav")
         convert_to_wav(local_raw, local_wav, rid)
 
-        # 3) Transcribe
+        # 3) Transcribe (JSON w/ per-word + TXT)
         transcript_json, transcript_txt = run_transcription(local_wav, rid)
 
-        # 4) HLS export & upload
-        hls_dir = os.path.join(temp_dir, "hls")
-        master_local = export_hls(local_raw, hls_dir, rid)
-        processed_path = f"{processed_prefix}/master.m3u8"
-        # upload m3u8 + segments
-        for fname in os.listdir(hls_dir):
-            local_fp = os.path.join(hls_dir, fname)
-            remote_fp = f"{processed_prefix}/{fname}"
-            ctype = "application/vnd.apple.mpegurl" if fname.endswith(".m3u8") else "video/mp2t"
-            with open(local_fp, "rb") as f:
-                sb_upload(PROCESSED_BUCKET, remote_fp, f.read(), ctype, rid)
+        # 4) NO HLS: just upload the original WebM for playback
+        processed_path = f"{processed_prefix}/source.webm"
+        with open(local_raw, "rb") as f:
+            sb_upload(PROCESSED_BUCKET, processed_path, f.read(), "video/webm", rid)
 
-        # 5) Upload transcripts next to processed prefix
+        # 5) Upload transcripts alongside processed prefix
         transcript_base = f"{processed_prefix}/transcript"
         transcript_json_path = f"{transcript_base}.json"
         transcript_txt_path = f"{transcript_base}.txt"
@@ -226,9 +204,9 @@ def process(data: dict, x_api_key: str = Header(None)):
         sb_upload(TRANSCRIPTS_BUCKET, transcript_txt_path, transcript_txt.encode("utf-8"), "text/plain; charset=utf-8", rid)
 
         resp = {
-            "processed_path": processed_path,
-            "transcript_json": transcript_json_path,
-            "transcript_txt": transcript_txt_path,
+            "processed_path": processed_path,           # processed/.../source.webm
+            "transcript_json": transcript_json_path,    # transcripts/.../transcript.json
+            "transcript_txt": transcript_txt_path,      # transcripts/.../transcript.txt
             "duration": transcript_json["duration"],
             "language": transcript_json["language"],
             "request_id": rid,
@@ -253,4 +231,3 @@ def process(data: dict, x_api_key: str = Header(None)):
                 log("CLEANUP temp dir", rid)
         except Exception:
             log("CLEANUP error (ignored)", rid)
-
