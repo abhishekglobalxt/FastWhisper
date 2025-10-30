@@ -1,167 +1,187 @@
-import os, tempfile, shutil, json, time, subprocess, uuid
-from pathlib import Path
-from typing import Optional
+import os
+import tempfile
+import shutil
+import subprocess
 import requests
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+import datetime
+import json
 
-# --------- ENV VARS (set these in Railway/Render) ----------
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-SUPABASE_SERVICE_ROLE = os.environ["SUPABASE_SERVICE_ROLE"]
+from fastapi import FastAPI, HTTPException, Header
+from faster_whisper import WhisperModel
+from supabase import create_client, Client
+
+# ---- ENV VARIABLES ----
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")  # service role key
 RAW_BUCKET = os.environ.get("RAW_BUCKET", "raw")
 PROCESSED_BUCKET = os.environ.get("PROCESSED_BUCKET", "processed")
 TRANSCRIPTS_BUCKET = os.environ.get("TRANSCRIPTS_BUCKET", "transcripts")
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")  # "small" for better quality
+API_KEY = os.environ.get("TRANSCRIBE_API_KEY", "changeme")  # protect endpoint
+
+# ---- INIT ----
+app = FastAPI()
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Load Whisper model once (CPU, int8 for Render free tier; switch to cuda/float16 for GPU)
+model = WhisperModel("medium", device="cpu", compute_type="int8")
 
 
+# ---- HELPERS ----
+def download_file_from_supabase(raw_path: str, temp_dir: str) -> str:
+    """Download file from private Supabase bucket into temp dir, return local path."""
+    # Strip bucket prefix if present (avoid raw/raw bug)
+    if raw_path.startswith(f"{RAW_BUCKET}/"):
+        raw_path = raw_path[len(RAW_BUCKET) + 1 :]
+
+    url = f"{SUPABASE_URL}/storage/v1/object/raw/{RAW_BUCKET}/{raw_path}"
+
+    headers = {"Authorization": f"Bearer {SUPABASE_KEY}"}
+    response = requests.get(url, headers=headers, stream=True)
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Failed to download {url}: {response.text}")
+
+    local_path = os.path.join(temp_dir, os.path.basename(raw_path))
+    with open(local_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+    return local_path
 
 
-# --------- FASTAPI ----------
-app = FastAPI(title="Video Processing Worker", version="1.0.0")
-#----Health
+def convert_to_wav(input_path: str, output_path: str):
+    """Convert webm/mp4/etc to WAV using ffmpeg."""
+    cmd = [
+        "ffmpeg",
+        "-i",
+        input_path,
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-f",
+        "wav",
+        output_path,
+        "-y",
+    ]
+    subprocess.run(cmd, check=True)
 
 
+def run_transcription(audio_path: str):
+    """Run Whisper transcription, return both JSON + TXT."""
+    segments, info = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
+
+    transcript_data = {
+        "duration": info.duration,
+        "language": info.language,
+        "segments": [],
+    }
+
+    transcript_txt = []
+
+    for seg in segments:
+        segment_dict = {
+            "id": seg.id,
+            "start": seg.start,
+            "end": seg.end,
+            "text": seg.text,
+        }
+        if seg.words:
+            segment_dict["words"] = [
+                {"word": w.word, "start": w.start, "end": w.end} for w in seg.words
+            ]
+        transcript_data["segments"].append(segment_dict)
+        transcript_txt.append(seg.text.strip())
+
+    return transcript_data, "\n".join(transcript_txt)
+
+
+def upload_to_supabase(bucket: str, path: str, content: bytes, content_type: str):
+    """Upload content to Supabase storage."""
+    res = supabase.storage.from_(bucket).upload(path, content, {"content-type": content_type, "upsert": True})
+    if "error" in str(res).lower():
+        raise HTTPException(status_code=502, detail=f"Upload failed: {res}")
+
+
+# ---- ROUTES ----
 @app.get("/health")
 def health():
-    return {"ok": True}
-    
-# --------- MODELS ----------
-class ProcessIn(BaseModel):
-    rawPath: str                      # e.g. "intv123/TOK123/q1.webm"
-    processedPrefix: str              # e.g. "intv123/TOK123/q1"
-    transcriptPrefix: Optional[str] = None  # defaults to processedPrefix
+    return {"status": "ok"}
 
-# --------- UTILS ----------
-def supabase_headers(extra=None):
-    h = {
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE}",
-        "apikey": SUPABASE_SERVICE_ROLE,
-    }
-    if extra:
-        h.update(extra)
-    return h
 
-def sb_download_object(bucket: str, path: str, dest_file: Path):
-    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}"
-    print("DOWNLOAD:", f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}", flush=True)
-    with requests.get(url, headers=supabase_headers(), stream=True) as r:
-        if r.status_code >= 300:
-            raise HTTPException(status_code=502, detail=f"Supabase download failed {r.status_code}: {r.text}")
-        with open(dest_file, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    f.write(chunk)
-
-def sb_upload_file(bucket: str, dst_path: str, src_file: Path, content_type: Optional[str] = None, upsert=True):
-    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{dst_path}"
-    headers = supabase_headers({"x-upsert": "true" if upsert else "false"})
-    if content_type:
-        headers["Content-Type"] = content_type
-    with open(src_file, "rb") as f:
-        r = requests.post(url, headers=headers, data=f)
-    if r.status_code >= 300:
-        raise HTTPException(status_code=502, detail=f"Supabase upload failed {r.status_code}: {r.text}")
-
-def run_ffmpeg_to_hls(input_file: Path, out_dir: Path) -> float:
-    """
-    Convert input_file -> HLS in out_dir.
-    Returns duration (seconds) via ffprobe.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # Probe duration
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=nw=1:nk=1", str(input_file)],
-        capture_output=True, text=True
-    )
-    duration = float(probe.stdout.strip()) if probe.returncode == 0 and probe.stdout.strip() else 0.0
-
-    # HLS encode (single bitrate; you can add renditions later)
-    cmd = [
-        "ffmpeg", "-y", "-i", str(input_file),
-        "-c:v", "h264", "-profile:v", "main", "-level", "3.1",
-        "-preset", "veryfast", "-b:v", "2500k", "-maxrate", "2800k", "-bufsize", "5000k",
-        "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
-        "-hls_time", "4", "-hls_playlist_type", "vod",
-        "-hls_segment_filename", str(out_dir / "segment_%03d.ts"),
-        str(out_dir / "master.m3u8")
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise HTTPException(status_code=500, detail=f"FFmpeg failed: {proc.stderr[:5000]}")
-    return duration
-
-def run_whisper(input_file: Path, out_json: Path, out_txt: Path):
-    # Import here so app boots even if model isn’t downloaded yet.
-    from faster_whisper import WhisperModel
-    model_size = WHISPER_MODEL
-    model = WhisperModel(model_size, compute_type="int8")  # memory friendly
-    segments, info = model.transcribe(str(input_file), vad_filter=True)
-
-    # Write plain text + segments
-    texts = []
-    seg_json = []
-    for s in segments:
-        seg_json.append({
-            "start": s.start,
-            "end": s.end,
-            "text": s.text.strip()
-        })
-        texts.append(s.text.strip())
-
-    out_txt.write_text("\n".join(texts), encoding="utf-8")
-    out_json.write_text(json.dumps({
-        "language": getattr(info, "language", None),
-        "duration": getattr(info, "duration", None),
-        "segments": seg_json
-    }, ensure_ascii=False), encoding="utf-8")
-
-# --------- API ----------
 @app.post("/process")
-def process_video(payload: ProcessIn):
-    t0 = time.time()
-    transcript_prefix = payload.transcriptPrefix or payload.processedPrefix
+async def process_file(data: dict, x_api_key: str = Header(None)):
+    # Security check
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Temp workspace
-    workdir = Path(tempfile.mkdtemp(prefix="proc-"))
+    raw_path = data.get("rawPath")
+    processed_prefix = data.get("processedPrefix")
+    if not raw_path or not processed_prefix:
+        raise HTTPException(status_code=400, detail="Missing rawPath or processedPrefix")
+
+    temp_dir = tempfile.mkdtemp()
+
     try:
-        raw_local = workdir / "input.raw"
-        hls_dir = workdir / "hls"
-        transcript_json = workdir / "transcript.json"
-        transcript_txt = workdir / "transcript.txt"
+        # ---- Download raw file ----
+        local_raw = download_file_from_supabase(raw_path, temp_dir)
 
-        # 1) Download raw from Supabase
-        sb_download_object(RAW_BUCKET, payload.rawPath, raw_local)
+        # ---- Convert to wav ----
+        temp_wav = os.path.join(temp_dir, "audio.wav")
+        convert_to_wav(local_raw, temp_wav)
 
-        # 2) FFmpeg -> HLS
-        duration = run_ffmpeg_to_hls(raw_local, hls_dir)
+        # ---- Transcribe ----
+        transcript_json, transcript_txt = run_transcription(temp_wav)
 
-        # 3) Whisper -> transcripts
-        run_whisper(raw_local, transcript_json, transcript_txt)
+        # ---- Upload HLS processed version (for streaming) ----
+        processed_path = f"{processed_prefix}/master.m3u8"
+        # Example ffmpeg HLS export
+        hls_dir = os.path.join(temp_dir, "hls")
+        os.makedirs(hls_dir, exist_ok=True)
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-i",
+                local_raw,
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                "-f",
+                "hls",
+                "-hls_time",
+                "4",
+                "-hls_list_size",
+                "0",
+                os.path.join(hls_dir, "master.m3u8"),
+            ],
+            check=True,
+        )
+        # Upload HLS files (m3u8 + segments)
+        for fname in os.listdir(hls_dir):
+            path = f"{processed_prefix}/{fname}"
+            with open(os.path.join(hls_dir, fname), "rb") as f:
+                upload_to_supabase(PROCESSED_BUCKET, path, f.read(), "application/vnd.apple.mpegurl" if fname.endswith(".m3u8") else "video/mp2t")
 
-        # 4) Upload HLS files to processed bucket
-        #    processed path layout: processed/<prefix>/master.m3u8  + segments
-        processed_base = f"{payload.processedPrefix}"
-        sb_upload_file(PROCESSED_BUCKET, f"{processed_base}/master.m3u8", hls_dir / "master.m3u8", "application/vnd.apple.mpegurl")
-        for seg in sorted(hls_dir.glob("segment_*.ts")):
-            sb_upload_file(PROCESSED_BUCKET, f"{processed_base}/{seg.name}", seg, "video/mp2t")
+        # ---- Upload transcripts ----
+        transcript_prefix = f"{processed_prefix}/transcript"
+        transcript_json_path = f"{transcript_prefix}.json"
+        transcript_txt_path = f"{transcript_prefix}.txt"
 
-        # 5) Upload transcripts to transcripts bucket
-        transcript_base = f"{transcript_prefix}"
-        sb_upload_file(TRANSCRIPTS_BUCKET, f"{transcript_base}.json", transcript_json, "application/json")
-        sb_upload_file(TRANSCRIPTS_BUCKET, f"{transcript_base}.txt", transcript_txt, "text/plain; charset=utf-8")
+        upload_to_supabase(TRANSCRIPTS_BUCKET, transcript_json_path, json.dumps(transcript_json).encode("utf-8"), "application/json")
+        upload_to_supabase(TRANSCRIPTS_BUCKET, transcript_txt_path, transcript_txt.encode("utf-8"), "text/plain; charset=utf-8")
 
-        elapsed = round(time.time() - t0, 2)
+        # ---- Response ----
         return {
-            "ok": True,
-            "processed_path": f"{processed_base}/master.m3u8",
-            "transcript_path": f"{transcript_base}.json",
-            "duration_seconds": int(duration),
-            "took_seconds": elapsed
+            "processed_path": processed_path,
+            "transcript_json": transcript_json_path,
+            "transcript_txt": transcript_txt_path,
+            "duration": transcript_json["duration"],
+            "language": transcript_json["language"],
         }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
     finally:
-        shutil.rmtree(workdir, ignore_errors=True)
-
-
-
-
+        shutil.rmtree(temp_dir, ignore_errors=True)
