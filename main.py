@@ -14,12 +14,12 @@ from faster_whisper import WhisperModel
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE")
 RAW_BUCKET = os.environ.get("RAW_BUCKET", "raw")
-PROCESSED_BUCKET = os.environ.get("PROCESSED_BUCKET", "processed")
+PROCESSED_BUCKET = os.environ.get("PROCESSED_BUCKET", "processed")  # unused now, kept for compatibility
 TRANSCRIPTS_BUCKET = os.environ.get("TRANSCRIPTS_BUCKET", "transcripts")
 API_KEY = os.environ.get("TRANSCRIBE_API_KEY", "changeme")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "medium")
 DEBUG = os.environ.get("DEBUG", "0") == "1"
-LOG_BODY = os.environ.get("LOG_BODY", "0") == "1"  # print response snippets for failures
+LOG_BODY = os.environ.get("LOG_BODY", "0") == "1"
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_KEY (or SUPABASE_SERVICE_ROLE) must be set")
@@ -47,14 +47,13 @@ def safe_snip(txt: str, n: int = 500) -> str:
     except Exception:
         return "<unprintable>"
 
-# ========= INIT HEAVY MODEL ONCE =========
+# ========= INIT WHISPER ONCE =========
 log(f"Loading Whisper model '{WHISPER_MODEL}' ...")
 model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
 log("Whisper model loaded.")
 
-# ========= SUPABASE STORAGE (REST) =========
+# ========= SUPABASE HELPERS =========
 def sb_headers(extra=None):
-    # Some Supabase setups want both Authorization and apikey
     h = {
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "apikey": SUPABASE_KEY,
@@ -66,15 +65,13 @@ def sb_headers(extra=None):
 def normalize_path_in_bucket(raw_path: str, rid: str) -> str:
     """
     Accepts:
-      - signed URL (…/storage/v1/object/sign/<bucket>/<path>?token=…)
-      - raw URL (…/storage/v1/object/raw/<bucket>/<path>)
-      - path with bucket prefix (raw/abc/def.webm)
-      - path inside bucket (abc/def.webm)
-    Returns path inside the bucket only (abc/def.webm).
+      - signed/raw URL
+      - 'raw/<path>'
+      - '<path>'
+    Returns the path inside the RAW bucket, without leading 'raw/'.
     """
     p = raw_path or ""
     if p.startswith("http"):
-        # extract bucket & path from URL
         import re
         m = re.search(r"/storage/v1/object/(?:sign|raw)/([^/]+)/(.+?)(?:\?|$)", p)
         if m:
@@ -84,23 +81,17 @@ def normalize_path_in_bucket(raw_path: str, rid: str) -> str:
             p = path_in_bucket
         else:
             log("normalize: URL pattern not recognized; passing as-is (may fail).", rid)
-    # strip leading 'raw/' if present
     if p.startswith(f"{RAW_BUCKET}/"):
         p = p[len(RAW_BUCKET) + 1 :]
         log(f"normalize: stripped leading '{RAW_BUCKET}/' -> {p}", rid)
     return p
 
 def sb_download(bucket: str, path_in_bucket: str, dest_path: str, rid: str):
-    """
-    Download from a path inside the bucket (authorized call),
-    or from a signed URL if 'path_in_bucket' happens to be a full URL.
-    """
     if path_in_bucket.startswith("http"):
         url = path_in_bucket
         log(f"DOWNLOAD (signed URL) -> {url}", rid)
         r = requests.get(url, stream=True, timeout=120)
     else:
-        # NOTE: /object/raw worked for your project, keeping it consistent with your successful logs
         url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path_in_bucket}"
         log(f"DOWNLOAD (bucket path) -> {url}", rid)
         r = requests.get(url, headers=sb_headers(), stream=True, timeout=120)
@@ -159,7 +150,8 @@ def health():
 
 @app.post("/process")
 def process(data: dict, x_api_key: str = Header(None)):
-    rid = str(uuid.uuid4())[:8]  # short request id for log correlation
+    rid = str(uuid.uuid4())[:8]
+    temp_dir = None
     try:
         log(f"REQ: /process body={safe_snip(json.dumps(data))}", rid)
 
@@ -168,45 +160,44 @@ def process(data: dict, x_api_key: str = Header(None)):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
         raw_path_in = data.get("rawPath")
-        processed_prefix = data.get("processedPrefix")
+        processed_prefix = data.get("processedPrefix")  # still used to place transcripts nicely
         if not raw_path_in or not processed_prefix:
             log("BAD REQUEST: missing rawPath or processedPrefix", rid)
             raise HTTPException(status_code=400, detail="Missing rawPath or processedPrefix")
 
-        # Normalize raw path
+        # Normalize the input path (we won't upload the video again)
         path_in_bucket = normalize_path_in_bucket(raw_path_in, rid)
         log(f"NORMALIZED rawPath -> {path_in_bucket}", rid)
 
+        # Work dir
         temp_dir = tempfile.mkdtemp()
         log(f"TEMP DIR -> {temp_dir}", rid)
 
-        # 1) Download RAW (.webm expected)
+        # 1) Download the existing WEBM (to transcribe)
         local_raw = os.path.join(temp_dir, os.path.basename(path_in_bucket) or "input.webm")
         sb_download(RAW_BUCKET, path_in_bucket, local_raw, rid)
 
-        # 2) Convert to WAV for Whisper
+        # 2) Convert to WAV
         local_wav = os.path.join(temp_dir, "audio.wav")
         convert_to_wav(local_raw, local_wav, rid)
 
-        # 3) Transcribe (JSON w/ per-word + TXT)
+        # 3) Transcribe
         transcript_json, transcript_txt = run_transcription(local_wav, rid)
 
-        # 4) NO HLS: just upload the original WebM for playback
-        processed_path = f"{processed_prefix}/source.webm"
-        with open(local_raw, "rb") as f:
-            sb_upload(PROCESSED_BUCKET, processed_path, f.read(), "video/webm", rid)
-
-        # 5) Upload transcripts alongside processed prefix
+        # 4) Upload ONLY transcripts (NO video upload here)
         transcript_base = f"{processed_prefix}/transcript"
         transcript_json_path = f"{transcript_base}.json"
         transcript_txt_path = f"{transcript_base}.txt"
         sb_upload(TRANSCRIPTS_BUCKET, transcript_json_path, json.dumps(transcript_json).encode("utf-8"), "application/json", rid)
         sb_upload(TRANSCRIPTS_BUCKET, transcript_txt_path, transcript_txt.encode("utf-8"), "text/plain; charset=utf-8", rid)
 
+        # 5) Respond with paths expected by your n8n/Supabase schema
         resp = {
-            "processed_path": processed_path,           # processed/.../source.webm
-            "transcript_json": transcript_json_path,    # transcripts/.../transcript.json
-            "transcript_txt": transcript_txt_path,      # transcripts/.../transcript.txt
+            # Point processed_path to the ALREADY-UPLOADED video under raw/
+            # so downstream UIs have a playable URL without schema changes.
+            "processed_path": f"{RAW_BUCKET}/{path_in_bucket}",
+            "transcript_json": transcript_json_path,
+            "transcript_txt": transcript_txt_path,
             "duration": transcript_json["duration"],
             "language": transcript_json["language"],
             "request_id": rid,
@@ -226,9 +217,8 @@ def process(data: dict, x_api_key: str = Header(None)):
         raise HTTPException(status_code=500, detail="internal_error")
     finally:
         try:
-            if 'temp_dir' in locals():
+            if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 log("CLEANUP temp dir", rid)
         except Exception:
             log("CLEANUP error (ignored)", rid)
-
